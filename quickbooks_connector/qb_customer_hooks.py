@@ -28,6 +28,7 @@ def on_customer_update(doc, method=None):
 def sync_customer_to_qb(doc, qb_customer_id):
     """Update customer in QuickBooks"""
     from quickbooks_connector.api import QuickBooksAPI
+    from quickbooks_connector.qb_address import subdivision_code
 
     api = QuickBooksAPI()
 
@@ -93,7 +94,7 @@ def sync_customer_to_qb(doc, qb_customer_id):
         if primary_address.city:
             bill_addr["City"] = primary_address.city
         if primary_address.state:
-            bill_addr["CountrySubDivisionCode"] = primary_address.state
+            bill_addr["CountrySubDivisionCode"] = subdivision_code(primary_address.state, api.settings)
         if primary_address.pincode:
             bill_addr["PostalCode"] = primary_address.pincode
         if primary_address.country:

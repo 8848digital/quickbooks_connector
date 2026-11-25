@@ -8,7 +8,7 @@ from urllib.parse import urlencode, quote
 import secrets
 from datetime import timedelta
 from frappe.utils import flt
-from quickbooks_connector import qb_tax
+from quickbooks_connector import qb_address, qb_tax
 
 # ============ CONSTANTS ============
 DEFAULT_CUSTOMER_TYPE = "Company"
@@ -971,7 +971,7 @@ def _update_party_address(bill_addr, party_type, party_name):
             "city": bill_addr.get('City', ''),
             "state": bill_addr.get('CountrySubDivisionCode', ''),
             "pincode": bill_addr.get('PostalCode', ''),
-            "country": bill_addr.get('Country', 'United Kingdom'),
+            "country": qb_address.normalize_country(bill_addr.get('Country'), get_settings()),
             "address_type": "Billing"
         }
 
@@ -1190,7 +1190,7 @@ def create_qb_invoice_from_sales_invoice(si):
             if addr.city:
                 bill_addr["City"] = addr.city
             if addr.state:
-                bill_addr["CountrySubDivisionCode"] = addr.state
+                bill_addr["CountrySubDivisionCode"] = qb_address.subdivision_code(addr.state, settings)
             if addr.pincode:
                 bill_addr["PostalCode"] = addr.pincode
             if addr.country:
