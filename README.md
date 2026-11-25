@@ -64,7 +64,7 @@ How documents are sent:
 
 - **Invoices and Credit Memos** — a document is *taxed* when it has a tax row on a **Tax** account with a non-zero amount. Lines are sent with tax code `TAX` (taxed) or `NON` (not taxed).
   - AST off: `TxnTaxDetail.TxnTaxCodeRef` = your US Sales Tax Code; QuickBooks calculates the tax from that code.
-  - AST on: `TxnTaxDetail.TotalTax` = ERPNext's tax amount (after discount), so QuickBooks uses ERPNext's figure.
+  - AST on: `TxnTaxDetail.TotalTax` = ERPNext's tax amount (after discount) together with `TxnTaxDetail.TxnTaxCodeRef`, as Intuit's override needs both. The code is your US Sales Tax Code if set; otherwise the document is created, and the TaxCode QuickBooks assigns is sent back with `TotalTax` in a follow-up update (amendments reuse the code already on the invoice).
   - `GlobalTaxCalculation` is never sent (QuickBooks does not support it for US companies).
 - **Bills and Vendor Credits** — lines carry no tax code; the purchase tax amount is added as one extra expense line on the same expense account.
 

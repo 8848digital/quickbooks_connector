@@ -1269,6 +1269,12 @@ def create_qb_invoice_from_sales_invoice(si):
         _mark_sales_invoice_sync_error(si, msg)
         frappe.throw(_(msg))
 
+    qb_invoice = _complete_us_ast_override(
+        payload, qb_invoice, si, settings,
+        lambda update: api.make_request(
+            "invoice", method="POST", data=update, params={"minorversion": 65}
+        ).get("Invoice")
+    )
 
     si.db_set("quickbooks_id", qb_invoice_id)
     si.db_set("quickbooks_doc_number", doc_number)
@@ -2663,6 +2669,27 @@ def retry_failed_syncs():
 
 
 
+def _complete_us_ast_override(sent_payload, entity, doc, settings, post_update):
+    """Finish Intuit's AST override when the TaxCode was only known after the
+    Invoice / CreditMemo was created (US, AST on, no us_sales_tax_code).
+
+    post_update(update) sends the sparse update and returns the updated entity.
+    Never raises, since the document already exists in QuickBooks. Returns the
+    latest entity.
+    """
+    try:
+        update = qb_tax.ast_override_update(sent_payload, entity, doc, settings)
+        if not update:
+            return entity
+        return post_update(update) or entity
+    except Exception as e:
+        frappe.log_error(
+            title="QuickBooks AST Override Error",
+            message=f"{doc.name}: {str(e)}"
+        )
+        return entity
+
+
 def _mark_sales_invoice_sync_error(si, error_message: str):
     try:
         si.db_set("quickbooks_last_sync", now_datetime())
@@ -3368,9 +3395,20 @@ def manual_create_credit_memo(sales_invoice_name):
         if response.status_code != 200:
             return {"success": False, "error": f"QB Error: {response.text}"}
 
-        credit_memo_id = response.json().get("CreditMemo", {}).get("Id")
+        credit_memo = response.json().get("CreditMemo", {})
+        credit_memo_id = credit_memo.get("Id")
         if not credit_memo_id:
             return {"success": False, "error": "No ID in response"}
+
+        def post_credit_memo_update(update):
+            r = requests.post(url, headers=headers, json=update)
+            if r.status_code != 200:
+                raise Exception(f"QB Error: {r.text}")
+            return r.json().get("CreditMemo")
+
+        credit_memo = _complete_us_ast_override(
+            payload, credit_memo, si, settings, post_credit_memo_update
+        )
 
         frappe.db.set_value("Sales Invoice", sales_invoice_name, "quickbooks_id", credit_memo_id)
         frappe.db.set_value("Sales Invoice", sales_invoice_name, "quickbooks_sync_status", "Synced")
@@ -3654,13 +3692,26 @@ def manual_amend_invoice(sales_invoice_name):
             "Line": lines
         }
 
-        qb_tax.apply_sales_tax(payload, si, settings)
+        # AST: reuse the TaxCode QuickBooks already put on this invoice
+        qb_tax.apply_sales_tax(
+            payload, si, settings, qb_tax_code=qb_tax.returned_tax_code(invoice_data)
+        )
 
         url_update = f"{base_url}/company/{settings.realm_id_company_id}/invoice?minorversion=65"
         response = requests.post(url_update, headers=headers, json=payload)
 
         if response.status_code != 200:
             return {"success": False, "error": f"QB Error: {response.text}"}
+
+        def post_invoice_update(update):
+            r = requests.post(url_update, headers=headers, json=update)
+            if r.status_code != 200:
+                raise Exception(f"QB Error: {r.text}")
+            return r.json().get("Invoice")
+
+        updated_invoice = _complete_us_ast_override(
+            payload, response.json().get("Invoice", {}), si, settings, post_invoice_update
+        )
 
         frappe.db.set_value("Sales Invoice", sales_invoice_name, "quickbooks_id", original_qb_id)
         frappe.db.set_value("Sales Invoice", sales_invoice_name, "quickbooks_sync_status", "Synced")

@@ -107,8 +107,12 @@ def sales_line_tax_code(doc, settings):
 	return uk_tax_code(invoice_tax_rate(doc), settings)
 
 
-def apply_sales_tax(payload, doc, settings):
-	"""Add transaction-level tax fields to an Invoice / CreditMemo payload."""
+def apply_sales_tax(payload, doc, settings, qb_tax_code=None):
+	"""Add transaction-level tax fields to an Invoice / CreditMemo payload.
+
+	qb_tax_code: for AST companies without us_sales_tax_code, the TaxCode Id
+	QuickBooks already put on this transaction (e.g. when amending), if known.
+	"""
 	if not is_us(settings):
 		payload["GlobalTaxCalculation"] = uk_global_tax_calculation(invoice_tax_rate(doc))
 		return payload
@@ -118,8 +122,16 @@ def apply_sales_tax(payload, doc, settings):
 		return payload
 
 	if getattr(settings, "us_uses_ast", 0):
-		# AST companies calculate tax in QuickBooks; force ERPNext's amount.
-		payload["TxnTaxDetail"] = {"TotalTax": us_total_tax(doc)}
+		# AST companies calculate tax in QuickBooks. Intuit's override needs
+		# both TxnTaxCodeRef and TotalTax to force ERPNext's amount. Without a
+		# known code, TotalTax is sent alone and ast_override_update() fixes it
+		# up with the code QuickBooks returns.
+		detail = {}
+		tax_code = getattr(settings, "us_sales_tax_code", None) or qb_tax_code
+		if tax_code:
+			detail["TxnTaxCodeRef"] = {"value": str(tax_code)}
+		detail["TotalTax"] = us_total_tax(doc)
+		payload["TxnTaxDetail"] = detail
 	else:
 		tax_code = getattr(settings, "us_sales_tax_code", None)
 		if not tax_code:
@@ -129,6 +141,37 @@ def apply_sales_tax(payload, doc, settings):
 			)
 		payload["TxnTaxDetail"] = {"TxnTaxCodeRef": {"value": str(tax_code)}}
 	return payload
+
+
+def returned_tax_code(entity):
+	"""TxnTaxDetail.TxnTaxCodeRef.value of a QuickBooks Invoice / CreditMemo."""
+	detail = (entity or {}).get("TxnTaxDetail") or {}
+	return (detail.get("TxnTaxCodeRef") or {}).get("value")
+
+
+def ast_override_update(sent_payload, entity, doc, settings):
+	"""Sparse update that completes the AST override, or None if not needed.
+
+	Needed for a taxed US document on an AST company when the request went
+	out without a TxnTaxCodeRef: re-send TotalTax with the TaxCode QuickBooks
+	assigned to the transaction.
+	"""
+	if not (is_us(settings) and getattr(settings, "us_uses_ast", 0) and us_is_taxed(doc)):
+		return None
+	if (sent_payload.get("TxnTaxDetail") or {}).get("TxnTaxCodeRef"):
+		return None
+	tax_code = returned_tax_code(entity)
+	if not tax_code or not entity.get("Id") or entity.get("SyncToken") is None:
+		return None
+	return {
+		"Id": str(entity["Id"]),
+		"SyncToken": str(entity["SyncToken"]),
+		"sparse": True,
+		"TxnTaxDetail": {
+			"TxnTaxCodeRef": {"value": str(tax_code)},
+			"TotalTax": us_total_tax(doc),
+		},
+	}
 
 
 def expense_line_tax_code(doc, settings, uk_fixed=None):

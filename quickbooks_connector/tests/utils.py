@@ -76,8 +76,10 @@ def item_row(code="ITEM-1", qty=2, rate=50.0):
 
 
 def _doc(**values):
-	values.setdefault("db_set", lambda *a, **k: None)
-	return SimpleNamespace(**values)
+	doc = SimpleNamespace(**values)
+	# record db_set() calls on the doc itself so tests can assert them
+	doc.db_set = lambda field, value=None, *a, **k: setattr(doc, field, value)
+	return doc
 
 
 def make_si(rate=20, items=None, extra_taxes=None, **overrides):
@@ -153,12 +155,19 @@ class Capture:
 		self.requests_post = mock.MagicMock(side_effect=self._requests_post)
 		self.requests_get = mock.MagicMock(side_effect=self._requests_get)
 		self.docs = {}
+		# QuickBooks entities to return, by key; a list is consumed in order.
+		self.responses = {}
 		self._stack = ExitStack()
 
-	@staticmethod
-	def _make_request(endpoint, method="GET", data=None, params=None, **kwargs):
+	def _next(self, key, default):
+		value = self.responses.get(key)
+		if isinstance(value, list):
+			return value.pop(0) if value else default
+		return value if value is not None else default
+
+	def _make_request(self, endpoint, method="GET", data=None, params=None, **kwargs):
 		if endpoint == "invoice":
-			return {"Invoice": {"Id": "100"}}
+			return {"Invoice": self._next("invoice", {"Id": "100"})}
 		if endpoint == "bill":
 			return {"Bill": {"Id": "101"}}
 		if endpoint.startswith("customer/"):
@@ -175,18 +184,18 @@ class Capture:
 
 	def _requests_post(self, url, headers=None, json=None, **kwargs):
 		if "/creditmemo" in url:
-			return self._response({"CreditMemo": {"Id": "200"}})
+			return self._response({"CreditMemo": self._next("creditmemo", {"Id": "200"})})
 		if "/vendorcredit" in url:
 			return self._response({"VendorCredit": {"Id": "300"}})
 		if "/invoice" in url:
-			return self._response({"Invoice": {"Id": "900"}})
+			return self._response({"Invoice": self._next("invoice_update", {"Id": "900"})})
 		if "/bill" in url:
 			return self._response({"Bill": {"Id": "900"}})
 		return self._response({})
 
 	def _requests_get(self, url, headers=None, **kwargs):
 		if "/invoice/" in url:
-			return self._response({"Invoice": {"SyncToken": "4"}})
+			return self._response({"Invoice": self._next("invoice_get", {"SyncToken": "4"})})
 		if "/bill/" in url:
 			return self._response({"Bill": {"SyncToken": "2"}})
 		return self._response({})
@@ -215,22 +224,43 @@ class Capture:
 
 	# -- helpers to read what was sent -------------------------------------
 
+	def posted_all(self, endpoint):
+		"""Payloads passed to QuickBooksAPI.make_request(endpoint, method='POST')."""
+		return [
+			kwargs["data"]
+			for args, kwargs in self.api_instance.make_request.call_args_list
+			if args and args[0] == endpoint and kwargs.get("method") == "POST"
+		]
+
 	def posted(self, endpoint):
-		"""Payload passed to QuickBooksAPI.make_request(endpoint, method='POST')."""
-		for call in self.api_instance.make_request.call_args_list:
-			args, kwargs = call
-			if args and args[0] == endpoint and kwargs.get("method") == "POST":
-				return kwargs["data"]
-		raise AssertionError(f"nothing POSTed to {endpoint}")
+		"""First payload POSTed to endpoint through QuickBooksAPI.make_request."""
+		sent = self.posted_all(endpoint)
+		if not sent:
+			raise AssertionError(f"nothing POSTed to {endpoint}")
+		return sent[0]
+
+	def posted_raw_all(self, url_part):
+		"""JSON bodies passed to requests.post for URLs containing url_part."""
+		return [
+			kwargs["json"]
+			for args, kwargs in self.requests_post.call_args_list
+			if url_part in (args[0] if args else kwargs["url"])
+		]
 
 	def posted_raw(self, url_part):
-		"""JSON body passed to requests.post for a URL containing url_part."""
-		for call in self.requests_post.call_args_list:
-			args, kwargs = call
-			url = args[0] if args else kwargs["url"]
-			if url_part in url:
-				return kwargs["json"]
-		raise AssertionError(f"nothing POSTed to a URL containing {url_part}")
+		"""First JSON body passed to requests.post for a URL containing url_part."""
+		sent = self.posted_raw_all(url_part)
+		if not sent:
+			raise AssertionError(f"nothing POSTed to a URL containing {url_part}")
+		return sent[0]
+
+	def set_values(self, doctype, name):
+		"""{field: value} written with frappe.db.set_value(doctype, name, ...)."""
+		return {
+			args[2]: args[3]
+			for args, kwargs in frappe.db.set_value.call_args_list
+			if args[:2] == (doctype, name)
+		}
 
 
 def run_builder(builder, doc, settings=None):

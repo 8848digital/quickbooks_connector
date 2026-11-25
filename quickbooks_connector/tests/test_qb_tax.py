@@ -14,6 +14,7 @@ import frappe
 from quickbooks_connector import qb_tax
 from quickbooks_connector.tests.utils import (
 	FREIGHT_ACCOUNT,
+	Capture,
 	fake_get_value,
 	make_pi,
 	make_return,
@@ -120,9 +121,49 @@ class TestUSHelpers(DbMocked):
 		payload = qb_tax.apply_sales_tax({"GlobalTaxCalculation": "x"}, make_si(20), us_settings())
 		self.assertEqual(payload, {"TxnTaxDetail": {"TxnTaxCodeRef": {"value": "5"}}})
 
-	def test_apply_sales_tax_ast_on(self):
+	def test_apply_sales_tax_ast_on_sends_code_and_total(self):
 		payload = qb_tax.apply_sales_tax({}, make_si(20), us_settings(us_uses_ast=1))
-		self.assertEqual(payload, {"TxnTaxDetail": {"TotalTax": 20.0}})
+		self.assertEqual(payload, {"TxnTaxDetail": {"TxnTaxCodeRef": {"value": "5"}, "TotalTax": 20.0}})
+
+	def test_apply_sales_tax_ast_on_code_fallbacks(self):
+		no_code = us_settings(us_uses_ast=1, us_sales_tax_code="")
+		# no configured code and none known yet: TotalTax alone, fixed up after create
+		self.assertEqual(qb_tax.apply_sales_tax({}, make_si(20), no_code), {"TxnTaxDetail": {"TotalTax": 20.0}})
+		# code QuickBooks already put on the transaction
+		self.assertEqual(
+			qb_tax.apply_sales_tax({}, make_si(20), no_code, qb_tax_code="8"),
+			{"TxnTaxDetail": {"TxnTaxCodeRef": {"value": "8"}, "TotalTax": 20.0}},
+		)
+		# the configured code wins
+		self.assertEqual(
+			qb_tax.apply_sales_tax({}, make_si(20), us_settings(us_uses_ast=1), qb_tax_code="8"),
+			{"TxnTaxDetail": {"TxnTaxCodeRef": {"value": "5"}, "TotalTax": 20.0}},
+		)
+
+	def test_ast_override_update(self):
+		no_code = us_settings(us_uses_ast=1, us_sales_tax_code="")
+		entity = {"Id": "100", "SyncToken": "0", "TxnTaxDetail": {"TxnTaxCodeRef": {"value": "8"}, "TotalTax": 18.5}}
+		sent = {"TxnTaxDetail": {"TotalTax": 20.0}}
+		self.assertEqual(
+			qb_tax.ast_override_update(sent, entity, make_si(20), no_code),
+			{
+				"Id": "100",
+				"SyncToken": "0",
+				"sparse": True,
+				"TxnTaxDetail": {"TxnTaxCodeRef": {"value": "8"}, "TotalTax": 20.0},
+			},
+		)
+
+	def test_ast_override_update_not_needed(self):
+		no_code = us_settings(us_uses_ast=1, us_sales_tax_code="")
+		entity = {"Id": "100", "SyncToken": "0", "TxnTaxDetail": {"TxnTaxCodeRef": {"value": "8"}}}
+		sent_with_code = {"TxnTaxDetail": {"TxnTaxCodeRef": {"value": "5"}, "TotalTax": 20.0}}
+		sent = {"TxnTaxDetail": {"TotalTax": 20.0}}
+		self.assertIsNone(qb_tax.ast_override_update(sent_with_code, entity, make_si(20), no_code))
+		self.assertIsNone(qb_tax.ast_override_update(sent, entity, make_si(0), no_code))  # untaxed
+		self.assertIsNone(qb_tax.ast_override_update(sent, entity, make_si(20), us_settings()))  # AST off
+		self.assertIsNone(qb_tax.ast_override_update(sent, entity, make_si(20), make_settings()))  # UK
+		self.assertIsNone(qb_tax.ast_override_update(sent, {"Id": "100", "SyncToken": "0"}, make_si(20), no_code))
 
 	def test_apply_sales_tax_untaxed(self):
 		self.assertEqual(qb_tax.apply_sales_tax({}, make_si(0), us_settings()), {})
@@ -194,7 +235,7 @@ class TestUSPayloads(unittest.TestCase):
 		payload = run_builder("invoice", make_si(20), us_settings(us_uses_ast=1))
 		self.assertNoGlobalTax(payload)
 		self.assertEqual(payload["Line"], [us_sales_line("TAX")])
-		self.assertEqual(payload["TxnTaxDetail"], {"TotalTax": 20.0})
+		self.assertEqual(payload["TxnTaxDetail"], {"TxnTaxCodeRef": {"value": "5"}, "TotalTax": 20.0})
 
 	def test_invoice_untaxed(self):
 		for ast in (0, 1):
@@ -214,7 +255,7 @@ class TestUSPayloads(unittest.TestCase):
 		payload = run_builder("credit_memo", doc, us_settings(us_uses_ast=1))
 		self.assertNoGlobalTax(payload)
 		self.assertEqual(payload["Line"], [us_sales_line("TAX")])
-		self.assertEqual(payload["TxnTaxDetail"], {"TotalTax": 20.0})
+		self.assertEqual(payload["TxnTaxDetail"], {"TxnTaxCodeRef": {"value": "5"}, "TotalTax": 20.0})
 
 	def test_amend_invoice_ast_off(self):
 		doc = make_si(20, name="SINV-0001-1", amended_from="SINV-0001")
@@ -260,6 +301,90 @@ class TestUSPayloads(unittest.TestCase):
 		self.assertNoGlobalTax(payload)
 		self.assertNotIn("TaxCodeRef", json.dumps(payload))
 		self.assertEqual(payload["Line"][-1], US_TAX_LINE)
+
+
+def qb_entity(entity_id, sync_token, tax_code=None, total_tax=None):
+	detail = {}
+	if tax_code:
+		detail["TxnTaxCodeRef"] = {"value": tax_code}
+	if total_tax is not None:
+		detail["TotalTax"] = total_tax
+	return {"Id": entity_id, "SyncToken": sync_token, "TxnTaxDetail": detail}
+
+
+class TestUSAstOverride(unittest.TestCase):
+	"""AST on, no us_sales_tax_code: finish the override with QuickBooks' TaxCode."""
+
+	settings = staticmethod(lambda: us_settings(us_uses_ast=1, us_sales_tax_code=""))
+
+	def test_invoice_sends_followup_with_returned_code(self):
+		from quickbooks_connector import api
+
+		doc = make_si(20)
+		with Capture(self.settings()) as cap:
+			cap.responses["invoice"] = [qb_entity("100", "0", "8", 18.5), qb_entity("100", "1", "8", 20.0)]
+			result = api.create_qb_invoice_from_sales_invoice(doc)
+			sent = cap.posted_all("invoice")
+		self.assertEqual(result, {"qb_invoice_id": "100"})
+		self.assertEqual(sent[0]["TxnTaxDetail"], {"TotalTax": 20.0})
+		self.assertEqual(
+			sent[1],
+			{
+				"Id": "100",
+				"SyncToken": "0",
+				"sparse": True,
+				"TxnTaxDetail": {"TxnTaxCodeRef": {"value": "8"}, "TotalTax": 20.0},
+			},
+		)
+		self.assertEqual(doc.quickbooks_id, "100")
+
+	def test_no_followup_when_code_configured(self):
+		from quickbooks_connector import api
+
+		with Capture(us_settings(us_uses_ast=1)) as cap:
+			cap.responses["invoice"] = [qb_entity("100", "0", "5", 20.0)]
+			api.create_qb_invoice_from_sales_invoice(make_si(20))
+			self.assertEqual(len(cap.posted_all("invoice")), 1)
+
+	def test_followup_failure_keeps_sync(self):
+		from quickbooks_connector import api
+
+		doc = make_si(20)
+		with Capture(self.settings()) as cap, mock.patch.object(frappe, "log_error") as log_error:
+			cap.api_instance.make_request.side_effect = [
+				{"Invoice": qb_entity("100", "0", "8", 18.5)},
+				Exception("QuickBooks down"),
+			]
+			result = api.create_qb_invoice_from_sales_invoice(doc)
+		self.assertEqual(result, {"qb_invoice_id": "100"})
+		self.assertEqual(doc.quickbooks_id, "100")
+		log_error.assert_called_once()
+
+	def test_credit_memo_sends_followup_with_returned_code(self):
+		doc = make_return(make_si(20, name="SINV-RET-0001"))
+		with Capture(self.settings()) as cap:
+			cap.docs[("Sales Invoice", doc.name)] = doc
+			cap.responses["creditmemo"] = [qb_entity("200", "0", "8", 18.5), qb_entity("200", "1", "8", 20.0)]
+			from quickbooks_connector import api
+
+			self.assertTrue(api.manual_create_credit_memo(doc.name)["success"])
+			sent = cap.posted_raw_all("/creditmemo")
+		self.assertEqual(len(sent), 2)
+		self.assertEqual(sent[1]["TxnTaxDetail"], {"TxnTaxCodeRef": {"value": "8"}, "TotalTax": 20.0})
+		self.assertEqual(sent[1]["SyncToken"], "0")
+
+	def test_amend_reuses_code_from_existing_invoice(self):
+		doc = make_si(20, name="SINV-0001-1", amended_from="SINV-0001")
+		with Capture(self.settings()) as cap:
+			cap.docs[("Sales Invoice", doc.name)] = doc
+			cap.responses["invoice_get"] = qb_entity("900", "4", "8", 18.5)
+			cap.responses["invoice_update"] = qb_entity("900", "5", "8", 20.0)
+			from quickbooks_connector import api
+
+			self.assertTrue(api.manual_amend_invoice(doc.name)["success"])
+			sent = cap.posted_raw_all("/invoice?")
+		self.assertEqual(len(sent), 1)
+		self.assertEqual(sent[0]["TxnTaxDetail"], {"TxnTaxCodeRef": {"value": "8"}, "TotalTax": 20.0})
 
 
 class TestPreferencesAndTaxCodes(unittest.TestCase):
