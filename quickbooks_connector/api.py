@@ -1108,9 +1108,13 @@ def push_sales_invoice_to_quickbooks(sales_invoice_name: str):
 
         result = create_qb_invoice_from_sales_invoice(si)
 
+        message = f"Invoice synced to QuickBooks. QB Invoice ID: {result.get('qb_invoice_id')}"
+        if result.get("warning"):
+            message += f"<br><br>Warning: {result['warning']}"
+
         return {
             "success": True,
-            "message": f"Invoice synced to QuickBooks. QB Invoice ID: {result.get('qb_invoice_id')}",
+            "message": message,
             "qb_invoice_id": result.get("qb_invoice_id")
         }
 
@@ -1275,12 +1279,13 @@ def create_qb_invoice_from_sales_invoice(si):
             "invoice", method="POST", data=update, params={"minorversion": 65}
         ).get("Invoice")
     )
+    tax_warning = _us_sales_tax_warning(qb_invoice, si, settings, "Invoice")
 
     si.db_set("quickbooks_id", qb_invoice_id)
     si.db_set("quickbooks_doc_number", doc_number)
     si.db_set("quickbooks_last_sync", now_datetime())
-    si.db_set("quickbooks_sync_status", "Synced")
-    si.db_set("quickbooks_sync_error", "")
+    si.db_set("quickbooks_sync_status", SYNC_STATUS_WARNING if tax_warning else "Synced")
+    si.db_set("quickbooks_sync_error", tax_warning or "")
 
     log_action(
         "ERPNext Invoice -> QuickBooks Created",
@@ -1293,7 +1298,10 @@ def create_qb_invoice_from_sales_invoice(si):
         entity_id=qb_invoice_id
     )
 
-    return {"qb_invoice_id": qb_invoice_id}
+    result = {"qb_invoice_id": qb_invoice_id}
+    if tax_warning:
+        result["warning"] = tax_warning
+    return result
 
 
 
@@ -2690,6 +2698,41 @@ def _complete_us_ast_override(sent_payload, entity, doc, settings, post_update):
         return entity
 
 
+SYNC_STATUS_WARNING = "Synced with Warning"
+
+
+def _us_sales_tax_warning(entity, doc, settings, entity_type):
+    """US only: warning text if QuickBooks' TotalTax differs from ERPNext's
+    sales tax by more than 0.01, else None. The sync itself is kept; the
+    mismatch is logged so it can be reviewed in QuickBooks.
+    """
+    mismatch = qb_tax.tax_mismatch(entity, doc, settings)
+    if not mismatch:
+        return None
+    qb_total, erp_total = mismatch
+    message = (
+        f"Sales tax mismatch: QuickBooks TotalTax {qb_total:.2f}, "
+        f"ERPNext sales tax {erp_total:.2f}. Synced; please review the "
+        f"tax in QuickBooks."
+    )
+    qb_id = entity.get("Id")
+    frappe.logger().warning(f"QuickBooks sales tax mismatch for {doc.name}: {message}")
+    log_action(
+        "QuickBooks Sales Tax Mismatch",
+        {
+            "document": doc.name,
+            "qb_id": qb_id,
+            "qb_total_tax": qb_total,
+            "erpnext_total_tax": erp_total,
+        },
+        status="Info",
+        entity_type=entity_type,
+        entity_id=qb_id,
+        error=message
+    )
+    return message
+
+
 def _mark_sales_invoice_sync_error(si, error_message: str):
     try:
         si.db_set("quickbooks_last_sync", now_datetime())
@@ -3409,13 +3452,17 @@ def manual_create_credit_memo(sales_invoice_name):
         credit_memo = _complete_us_ast_override(
             payload, credit_memo, si, settings, post_credit_memo_update
         )
+        tax_warning = _us_sales_tax_warning(credit_memo, si, settings, "CreditMemo")
 
         frappe.db.set_value("Sales Invoice", sales_invoice_name, "quickbooks_id", credit_memo_id)
-        frappe.db.set_value("Sales Invoice", sales_invoice_name, "quickbooks_sync_status", "Synced")
-        frappe.db.set_value("Sales Invoice", sales_invoice_name, "quickbooks_sync_error", "")
+        frappe.db.set_value("Sales Invoice", sales_invoice_name, "quickbooks_sync_status", SYNC_STATUS_WARNING if tax_warning else "Synced")
+        frappe.db.set_value("Sales Invoice", sales_invoice_name, "quickbooks_sync_error", tax_warning or "")
         frappe.db.set_value("Sales Invoice", sales_invoice_name, "quickbooks_last_sync", frappe.utils.now_datetime())
 
-        return {"success": True, "message": f"Credit Memo created in QB. ID: {credit_memo_id}"}
+        message = f"Credit Memo created in QB. ID: {credit_memo_id}"
+        if tax_warning:
+            message += f"<br><br>Warning: {tax_warning}"
+        return {"success": True, "message": message}
 
     except Exception as e:
         return {"success": False, "error": str(e)}
@@ -3712,13 +3759,17 @@ def manual_amend_invoice(sales_invoice_name):
         updated_invoice = _complete_us_ast_override(
             payload, response.json().get("Invoice", {}), si, settings, post_invoice_update
         )
+        tax_warning = _us_sales_tax_warning(updated_invoice, si, settings, "Invoice")
 
         frappe.db.set_value("Sales Invoice", sales_invoice_name, "quickbooks_id", original_qb_id)
-        frappe.db.set_value("Sales Invoice", sales_invoice_name, "quickbooks_sync_status", "Synced")
-        frappe.db.set_value("Sales Invoice", sales_invoice_name, "quickbooks_sync_error", "")
+        frappe.db.set_value("Sales Invoice", sales_invoice_name, "quickbooks_sync_status", SYNC_STATUS_WARNING if tax_warning else "Synced")
+        frappe.db.set_value("Sales Invoice", sales_invoice_name, "quickbooks_sync_error", tax_warning or "")
         frappe.db.set_value("Sales Invoice", sales_invoice_name, "quickbooks_last_sync", frappe.utils.now_datetime())
 
-        return {"success": True, "message": f"QB Invoice {original_qb_id} updated successfully"}
+        message = f"QB Invoice {original_qb_id} updated successfully"
+        if tax_warning:
+            message += f"<br><br>Warning: {tax_warning}"
+        return {"success": True, "message": message}
 
     except Exception as e:
         return {"success": False, "error": str(e)}

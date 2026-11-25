@@ -208,7 +208,7 @@ class Capture:
 		p(mock.patch(f"{API}.get_settings", return_value=self.settings))
 		p(mock.patch(f"{API}.QuickBooksAPI", return_value=self.api_instance))
 		p(mock.patch(f"{API}.get_valid_access_token", return_value="token"))
-		p(mock.patch(f"{API}.log_action"))
+		self.log_action = p(mock.patch(f"{API}.log_action"))
 		p(mock.patch(f"{API}._mark_sales_invoice_sync_error"))
 		p(mock.patch(f"{API}._mark_purchase_invoice_sync_error"))
 		p(mock.patch(f"{API}._mark_purchase_invoice_sync_success"))

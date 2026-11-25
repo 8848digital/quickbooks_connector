@@ -356,9 +356,11 @@ class TestUSAstOverride(unittest.TestCase):
 				Exception("QuickBooks down"),
 			]
 			result = api.create_qb_invoice_from_sales_invoice(doc)
-		self.assertEqual(result, {"qb_invoice_id": "100"})
+		self.assertEqual(result["qb_invoice_id"], "100")
 		self.assertEqual(doc.quickbooks_id, "100")
 		log_error.assert_called_once()
+		# QuickBooks kept its own 18.50, so the sync is flagged for review
+		self.assertEqual(doc.quickbooks_sync_status, "Synced with Warning")
 
 	def test_credit_memo_sends_followup_with_returned_code(self):
 		doc = make_return(make_si(20, name="SINV-RET-0001"))
@@ -385,6 +387,101 @@ class TestUSAstOverride(unittest.TestCase):
 			sent = cap.posted_raw_all("/invoice?")
 		self.assertEqual(len(sent), 1)
 		self.assertEqual(sent[0]["TxnTaxDetail"], {"TxnTaxCodeRef": {"value": "8"}, "TotalTax": 20.0})
+
+
+class TestUSTaxMismatch(unittest.TestCase):
+	"""QuickBooks' TotalTax vs ERPNext's sales tax after create / amend."""
+
+	def _create_invoice(self, doc, settings, qb_total):
+		from quickbooks_connector import api
+
+		with Capture(settings) as cap:
+			cap.responses["invoice"] = qb_entity("100", "0", "5", qb_total)
+			result = api.create_qb_invoice_from_sales_invoice(doc)
+			log_calls = [c.args[0] for c in cap.log_action.call_args_list]
+		return result, log_calls
+
+	def test_unit_tax_mismatch(self):
+		with mock.patch.object(frappe, "db", mock.MagicMock()):
+			frappe.db.get_value.side_effect = fake_get_value
+			s = us_settings()
+			self.assertEqual(qb_tax.tax_mismatch({"TxnTaxDetail": {"TotalTax": 19.0}}, make_si(20), s), (19.0, 20.0))
+			self.assertIsNone(qb_tax.tax_mismatch({"TxnTaxDetail": {"TotalTax": 20.01}}, make_si(20), s))
+			self.assertIsNone(qb_tax.tax_mismatch({"TxnTaxDetail": {"TotalTax": 19.99}}, make_si(20), s))
+			self.assertEqual(qb_tax.tax_mismatch({}, make_si(20), s), (0.0, 20.0))
+			self.assertIsNone(qb_tax.tax_mismatch({}, make_si(0), s))
+			self.assertEqual(
+				qb_tax.tax_mismatch({"TxnTaxDetail": {"TotalTax": -18.0}}, make_return(make_si(20)), s), (18.0, 20.0)
+			)
+			self.assertIsNone(qb_tax.tax_mismatch({"TxnTaxDetail": {"TotalTax": 1.0}}, make_si(20), make_settings()))
+
+	def test_invoice_mismatch_sets_warning(self):
+		doc = make_si(20)
+		result, log_calls = self._create_invoice(doc, us_settings(), 19.0)
+		self.assertEqual(doc.quickbooks_id, "100")
+		self.assertEqual(doc.quickbooks_sync_status, "Synced with Warning")
+		self.assertIn("19.00", doc.quickbooks_sync_error)
+		self.assertIn("20.00", doc.quickbooks_sync_error)
+		self.assertEqual(result["warning"], doc.quickbooks_sync_error)
+		self.assertIn("QuickBooks Sales Tax Mismatch", log_calls)
+
+	def test_invoice_within_tolerance_is_synced(self):
+		doc = make_si(20)
+		result, log_calls = self._create_invoice(doc, us_settings(), 20.01)
+		self.assertEqual(doc.quickbooks_sync_status, "Synced")
+		self.assertEqual(doc.quickbooks_sync_error, "")
+		self.assertEqual(result, {"qb_invoice_id": "100"})
+		self.assertNotIn("QuickBooks Sales Tax Mismatch", log_calls)
+
+	def test_untaxed_invoice_no_warning(self):
+		doc = make_si(0)
+		self._create_invoice(doc, us_settings(), 0)
+		self.assertEqual(doc.quickbooks_sync_status, "Synced")
+
+	def test_uk_never_checked(self):
+		doc = make_si(20)
+		result, log_calls = self._create_invoice(doc, make_settings(), 3.0)
+		self.assertEqual(doc.quickbooks_sync_status, "Synced")
+		self.assertEqual(result, {"qb_invoice_id": "100"})
+
+	def test_credit_memo_mismatch_sets_warning(self):
+		from quickbooks_connector import api
+
+		doc = make_return(make_si(20, name="SINV-RET-0001"))
+		with Capture(us_settings()) as cap:
+			cap.docs[("Sales Invoice", doc.name)] = doc
+			cap.responses["creditmemo"] = qb_entity("200", "0", "5", 17.0)
+			result = api.manual_create_credit_memo(doc.name)
+			written = cap.set_values("Sales Invoice", doc.name)
+		self.assertTrue(result["success"])
+		self.assertIn("Warning", result["message"])
+		self.assertEqual(written["quickbooks_id"], "200")
+		self.assertEqual(written["quickbooks_sync_status"], "Synced with Warning")
+		self.assertIn("17.00", written["quickbooks_sync_error"])
+		self.assertIn("20.00", written["quickbooks_sync_error"])
+
+	def test_credit_memo_match_is_synced(self):
+		from quickbooks_connector import api
+
+		doc = make_return(make_si(20, name="SINV-RET-0001"))
+		with Capture(us_settings()) as cap:
+			cap.docs[("Sales Invoice", doc.name)] = doc
+			cap.responses["creditmemo"] = qb_entity("200", "0", "5", 20.0)
+			api.manual_create_credit_memo(doc.name)
+			written = cap.set_values("Sales Invoice", doc.name)
+		self.assertEqual(written["quickbooks_sync_status"], "Synced")
+		self.assertEqual(written["quickbooks_sync_error"], "")
+
+	def test_amend_mismatch_sets_warning(self):
+		from quickbooks_connector import api
+
+		doc = make_si(20, name="SINV-0001-1", amended_from="SINV-0001")
+		with Capture(us_settings()) as cap:
+			cap.docs[("Sales Invoice", doc.name)] = doc
+			cap.responses["invoice_update"] = qb_entity("900", "5", "5", 25.0)
+			self.assertTrue(api.manual_amend_invoice(doc.name)["success"])
+			written = cap.set_values("Sales Invoice", doc.name)
+		self.assertEqual(written["quickbooks_sync_status"], "Synced with Warning")
 
 
 class TestPreferencesAndTaxCodes(unittest.TestCase):

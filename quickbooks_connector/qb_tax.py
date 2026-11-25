@@ -174,6 +174,25 @@ def ast_override_update(sent_payload, entity, doc, settings):
 	}
 
 
+TAX_MISMATCH_TOLERANCE = 0.01
+
+
+def tax_mismatch(entity, doc, settings):
+	"""Compare QuickBooks' TotalTax with ERPNext's sales tax (US only).
+
+	Returns (qb_total, erpnext_total) when they differ by more than 0.01,
+	else None. A missing TotalTax in the QuickBooks response counts as 0.
+	"""
+	if not is_us(settings) or not isinstance(entity, dict):
+		return None
+	qb_total = abs(flt((entity.get("TxnTaxDetail") or {}).get("TotalTax"), 2))
+	erp_total = us_total_tax(doc)
+	# round to cents so float noise (20.01 - 20.0 = 0.0100000001) is not a mismatch
+	if flt(abs(qb_total - erp_total), 2) > TAX_MISMATCH_TOLERANCE:
+		return qb_total, erp_total
+	return None
+
+
 def expense_line_tax_code(doc, settings, uk_fixed=None):
 	"""TaxCodeRef value for Bill / VendorCredit lines, or None to omit it.
 

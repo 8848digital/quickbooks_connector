@@ -66,6 +66,7 @@ How documents are sent:
   - AST off: `TxnTaxDetail.TxnTaxCodeRef` = your US Sales Tax Code; QuickBooks calculates the tax from that code.
   - AST on: `TxnTaxDetail.TotalTax` = ERPNext's tax amount (after discount) together with `TxnTaxDetail.TxnTaxCodeRef`, as Intuit's override needs both. The code is your US Sales Tax Code if set; otherwise the document is created, and the TaxCode QuickBooks assigns is sent back with `TotalTax` in a follow-up update (amendments reuse the code already on the invoice).
   - `GlobalTaxCalculation` is never sent (QuickBooks does not support it for US companies).
+  - After an Invoice / Credit Memo is created or amended, QuickBooks' `TotalTax` is compared with ERPNext's sales tax. If they differ by more than 0.01, the sync is kept but the Sales Invoice is marked **Synced with Warning**, both amounts are written to **QuickBooks Sync Error**, and a "QuickBooks Sales Tax Mismatch" entry is added to the Sync Log.
 - **Bills and Vendor Credits** — lines carry no tax code; the purchase tax amount is added as one extra expense line on the same expense account.
 
 Limitations:
