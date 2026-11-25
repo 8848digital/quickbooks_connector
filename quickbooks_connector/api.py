@@ -1140,30 +1140,9 @@ def create_qb_invoice_from_sales_invoice(si):
         _mark_sales_invoice_sync_error(si, msg)
         frappe.throw(_(msg))
 
+    # UK: VAT code from the invoice rate. US: "TAX" / "NON".
+    tax_code_id = qb_tax.sales_line_tax_code(si, settings)
 
-    default_tax_code = getattr(settings, 'default_tax_code', '12') or '12'
-
-
-    def get_qb_tax_code(tax_rate):
-        rate = float(tax_rate or 0)
-        if rate >= 20:
-            return "3"   
-        elif rate >= 5:
-            return "8"   
-        elif rate > 0:
-            return "10"   
-        else:
-            return default_tax_code 
-
-    
-    invoice_tax_rate = 0
-    if si.taxes:
-        for tax in si.taxes:
-            if float(tax.rate or 0) > 0:
-                invoice_tax_rate = float(tax.rate)
-                break
-
-    
     lines = []
     for row in si.items:
         qb_item_id = frappe.db.get_value("Item", row.item_code, "quickbooks_id")
@@ -1171,8 +1150,6 @@ def create_qb_invoice_from_sales_invoice(si):
             msg = f"Item '{row.item_code}' missing QuickBooks ID. Sync items first."
             _mark_sales_invoice_sync_error(si, msg)
             frappe.throw(_(msg))
-
-        tax_code_id = get_qb_tax_code(invoice_tax_rate)
 
         line = {
             "DetailType": "SalesItemLineDetail",
@@ -1275,14 +1252,8 @@ def create_qb_invoice_from_sales_invoice(si):
     elif si.due_date:
         payload["DueDate"] = str(si.due_date)
 
-    # -------------------------------
-    # TAX HANDLING (QB UK FORMAT)
-    # QB automatically calculates VAT based on TaxCodeRef in line items
-    # -------------------------------
-    if invoice_tax_rate > 0:
-        payload["GlobalTaxCalculation"] = "TaxExcluded"
-    else:
-        payload["GlobalTaxCalculation"] = "NotApplicable"
+    # Tax handling per region (UK: GlobalTaxCalculation, US: TxnTaxDetail)
+    qb_tax.apply_sales_tax(payload, si, settings)
 
     # Create invoice in QB
     qb_response = api.make_request("invoice", method="POST", data=payload, params={"minorversion": 65})
@@ -1366,28 +1337,8 @@ def create_qb_bill_from_purchase_invoice(pi):
 
     frappe.logger().info(f"Supplier: {pi.supplier}, QB Vendor ID: {qb_vendor_id}")
 
-    default_tax_code = getattr(settings, 'default_tax_code', '12') or '12'
+    invoice_tax_rate = qb_tax.invoice_tax_rate(pi)
 
-    def get_qb_tax_code(tax_rate):
-        rate = float(tax_rate or 0)
-        if rate >= 20:
-            return "3"   
-        elif rate >= 5:
-            return "8"   
-        elif rate > 0:
-            return "10"  
-        else:
-            return default_tax_code  
-
-
-    invoice_tax_rate = 0
-    if pi.taxes:
-        for tax in pi.taxes:
-            if float(tax.rate or 0) > 0:
-                invoice_tax_rate = float(tax.rate)
-                break
-
-    
     qb_account_id = frappe.db.get_value(
         "Account",
         [
@@ -1405,9 +1356,8 @@ def create_qb_bill_from_purchase_invoice(pi):
 
     frappe.logger().info(f"Using QB account ID: {qb_account_id} for purchase invoice {pi.name}")
 
-    
-    tax_code_id = get_qb_tax_code(invoice_tax_rate)
-
+    # UK: VAT code from the invoice rate. US: None (bills take no line tax codes).
+    tax_code_id = qb_tax.expense_line_tax_code(pi, settings)
 
     lines = []
     for idx, row in enumerate(pi.items):
@@ -1415,14 +1365,7 @@ def create_qb_bill_from_purchase_invoice(pi):
             "DetailType": "AccountBasedExpenseLineDetail",
             "Amount": float(row.amount or 0),
             "Description": f"{row.item_code}: {row.description or row.item_name or ''}",
-            "AccountBasedExpenseLineDetail": {
-                "AccountRef": {
-                    "value": qb_account_id
-                },
-                "TaxCodeRef": {
-                    "value": tax_code_id
-                }
-            }
+            "AccountBasedExpenseLineDetail": qb_tax.expense_line_detail(qb_account_id, tax_code_id)
         }
         lines.append(line)
 
@@ -1440,16 +1383,9 @@ def create_qb_bill_from_purchase_invoice(pi):
         "Line": lines
     }
 
-    # -------------------------------
-    # TAX HANDLING (QB UK FORMAT)
-    # QB automatically calculates VAT based on TaxCodeRef in line items
-    # -------------------------------
-    if invoice_tax_rate > 0:
-        payload["GlobalTaxCalculation"] = "TaxExcluded"
-    else:
-        payload["GlobalTaxCalculation"] = "NotApplicable"
+    # Tax handling per region (UK: GlobalTaxCalculation, US: extra tax line)
+    qb_tax.apply_purchase_tax(payload, pi, settings, qb_account_id)
 
-    
     if pi.name:
         payload["DocNumber"] = pi.name
 
@@ -2414,93 +2350,6 @@ def get_or_create_mode_of_payment(qb_payment_method, company):
         )
         return "Cash" 
     
-
-
-def extract_erp_taxes(doc):
-    """
-    Extract ERPNext tax rows safely
-    Works for Sales Invoice and Purchase Invoice
-    """
-    taxes = []
-    if hasattr(doc, "taxes") and doc.taxes:
-        for t in doc.taxes:
-            if flt(t.tax_amount) != 0 and t.account_head:
-                taxes.append({
-                    "account": t.account_head,
-                    "amount": flt(t.tax_amount),
-                    "rate": flt(t.rate),
-                    "description": t.description or t.account_head
-                })
-    return taxes
-
-
-def map_erp_tax_to_qb_taxcode(erp_tax_account):
-    """
-    Map ERP tax account → QuickBooks TaxRate → TaxCode
-    Uses Account.quickbooks_id as TaxRate ID
-    """
-    qb_taxrate_id = frappe.db.get_value(
-        "Account",
-        erp_tax_account,
-        "quickbooks_id"
-    )
-
-    if not qb_taxrate_id:
-        frappe.throw(
-            f"Tax Account '{erp_tax_account}' not mapped to QuickBooks "
-            f"(missing quickbooks_id on Account)."
-        )
-
-
-    return {
-        "TaxRateRef": {
-            "value": str(qb_taxrate_id)
-        }
-    }
-
-
-def build_qb_tax_detail(doc):
-    """
-    Build QuickBooks TxnTaxDetail object from ERP taxes
-    """
-    erp_taxes = extract_erp_taxes(doc)
-
-    if not erp_taxes:
-        return None
-
-    tax_lines = []
-    total_tax = 0
-
-    for tax in erp_taxes:
-        tax_code = map_erp_tax_to_qb_taxcode(tax["account"])
-        total_tax += tax["amount"]
-
-        tax_lines.append({
-            "Amount": float(tax["amount"]),
-            "DetailType": "TaxLineDetail",
-            "TaxLineDetail": {
-                "TaxRateRef": tax_code["TaxRateRef"],
-                "PercentBased": True,
-                "TaxPercent": float(tax["rate"])
-            }
-        })
-
-    return {
-        "TxnTaxCodeRef": {"value": "TAX"},  
-        "TotalTax": float(total_tax),
-        "TaxLine": tax_lines
-    }
-
-
-
-
-
-
-
-
-
-
-
 
 
 # ============ ENHANCED BULK PUSH FUNCTIONS ============
@@ -3478,21 +3327,7 @@ def manual_create_credit_memo(sales_invoice_name):
         if not qb_customer_id:
             return {"success": False, "error": f"Customer '{si.customer}' missing QB ID"}
 
-        default_tax_code = getattr(settings, 'default_tax_code', '12') or '12'
-
-        def get_qb_tax_code(tax_rate):
-            rate = float(tax_rate or 0)
-            if rate >= 20: return "3"
-            elif rate >= 5: return "8"
-            elif rate > 0: return "10"
-            return default_tax_code
-
-        invoice_tax_rate = 0
-        if si.taxes:
-            for tax in si.taxes:
-                if float(tax.rate or 0) > 0:
-                    invoice_tax_rate = float(tax.rate)
-                    break
+        tax_code_id = qb_tax.sales_line_tax_code(si, settings)
 
         lines = []
         for row in si.items:
@@ -3507,7 +3342,7 @@ def manual_create_credit_memo(sales_invoice_name):
                     "ItemRef": {"value": str(qb_item_id)},
                     "Qty": abs(float(row.qty)),
                     "UnitPrice": float(row.rate),
-                    "TaxCodeRef": {"value": get_qb_tax_code(invoice_tax_rate)}
+                    "TaxCodeRef": {"value": tax_code_id}
                 }
             })
 
@@ -3516,8 +3351,8 @@ def manual_create_credit_memo(sales_invoice_name):
             "DocNumber": str(si.name),
             "TxnDate": str(si.posting_date),
             "Line": lines,
-            "GlobalTaxCalculation": "TaxExcluded" if invoice_tax_rate > 0 else "NotApplicable"
         }
+        qb_tax.apply_sales_tax(payload, si, settings)
 
         api_obj = QuickBooksAPI()
         base_url = api_obj.get_api_endpoint()
@@ -3579,6 +3414,12 @@ def manual_create_vendor_credit(purchase_invoice_name):
         if not qb_account_id:
             return {"success": False, "error": "No expense account mapped to QuickBooks. Please sync accounts first via Quickbooks Setting → Sync Accounts."}
 
+        # NOTE: looks like a bug - UK vendor credits always send TaxCodeRef "12"
+        # and GlobalTaxCalculation "NotApplicable", ignoring the invoice's VAT
+        # rate (create_qb_bill_from_purchase_invoice maps the rate). Kept as-is
+        # so UK payloads do not change.
+        tax_code_id = qb_tax.expense_line_tax_code(pi, settings, uk_fixed="12")
+
         lines = []
         for row in pi.items:
             amount = abs(float(row.amount or 0))
@@ -3588,10 +3429,7 @@ def manual_create_vendor_credit(purchase_invoice_name):
                 "DetailType": "AccountBasedExpenseLineDetail",
                 "Amount": amount,
                 "Description": str(row.item_code),
-                "AccountBasedExpenseLineDetail": {
-                    "AccountRef": {"value": str(qb_account_id)},
-                    "TaxCodeRef": {"value": "12"}
-                }
+                "AccountBasedExpenseLineDetail": qb_tax.expense_line_detail(str(qb_account_id), tax_code_id)
             })
 
         if not lines:
@@ -3601,8 +3439,10 @@ def manual_create_vendor_credit(purchase_invoice_name):
             "VendorRef": {"value": str(qb_vendor_id)},
             "TxnDate": str(pi.posting_date),
             "Line": lines,
-            "GlobalTaxCalculation": "NotApplicable"
         }
+        qb_tax.apply_purchase_tax(
+            payload, pi, settings, str(qb_account_id), uk_fixed_global="NotApplicable"
+        )
 
         api_obj = QuickBooksAPI()
         base_url = api_obj.get_api_endpoint()
@@ -3786,21 +3626,7 @@ def manual_amend_invoice(sales_invoice_name):
         if not qb_customer_id:
             return {"success": False, "error": f"Customer '{si.customer}' missing QB ID"}
 
-        default_tax_code = getattr(settings, 'default_tax_code', '12') or '12'
-
-        def get_qb_tax_code(tax_rate):
-            rate = float(tax_rate or 0)
-            if rate >= 20: return "3"
-            elif rate >= 5: return "8"
-            elif rate > 0: return "10"
-            return default_tax_code
-
-        invoice_tax_rate = 0
-        if si.taxes:
-            for tax in si.taxes:
-                if float(tax.rate or 0) > 0:
-                    invoice_tax_rate = float(tax.rate)
-                    break
+        tax_code_id = qb_tax.sales_line_tax_code(si, settings)
 
         lines = []
         for row in si.items:
@@ -3815,7 +3641,7 @@ def manual_amend_invoice(sales_invoice_name):
                     "ItemRef": {"value": str(qb_item_id)},
                     "Qty": float(row.qty),
                     "UnitPrice": float(row.rate),
-                    "TaxCodeRef": {"value": get_qb_tax_code(invoice_tax_rate)}
+                    "TaxCodeRef": {"value": tax_code_id}
                 }
             })
 
@@ -3828,10 +3654,7 @@ def manual_amend_invoice(sales_invoice_name):
             "Line": lines
         }
 
-        if invoice_tax_rate > 0:
-            payload["GlobalTaxCalculation"] = "TaxExcluded"
-        else:
-            payload["GlobalTaxCalculation"] = "NotApplicable"
+        qb_tax.apply_sales_tax(payload, si, settings)
 
         url_update = f"{base_url}/company/{settings.realm_id_company_id}/invoice?minorversion=65"
         response = requests.post(url_update, headers=headers, json=payload)
@@ -3901,6 +3724,12 @@ def manual_amend_bill(purchase_invoice_name):
         if not qb_account_id:
             return {"success": False, "error": "No expense account mapped to QuickBooks. Please sync accounts first via Quickbooks Setting → Sync Accounts."}
 
+        # NOTE: looks like a bug - UK amended bills always send TaxCodeRef "12"
+        # and GlobalTaxCalculation "NotApplicable", ignoring the invoice's VAT
+        # rate (create_qb_bill_from_purchase_invoice maps the rate). Kept as-is
+        # so UK payloads do not change.
+        tax_code_id = qb_tax.expense_line_tax_code(pi, settings, uk_fixed="12")
+
         lines = []
         for row in pi.items:
             amount = float(row.amount or 0)
@@ -3910,10 +3739,7 @@ def manual_amend_bill(purchase_invoice_name):
                 "DetailType": "AccountBasedExpenseLineDetail",
                 "Amount": amount,
                 "Description": str(row.item_code),
-                "AccountBasedExpenseLineDetail": {
-                    "AccountRef": {"value": str(qb_account_id)},
-                    "TaxCodeRef": {"value": "12"}
-                }
+                "AccountBasedExpenseLineDetail": qb_tax.expense_line_detail(str(qb_account_id), tax_code_id)
             })
 
         payload = {
@@ -3922,8 +3748,10 @@ def manual_amend_bill(purchase_invoice_name):
             "VendorRef": {"value": str(qb_vendor_id)},
             "TxnDate": str(pi.posting_date),
             "Line": lines,
-            "GlobalTaxCalculation": "NotApplicable"
         }
+        qb_tax.apply_purchase_tax(
+            payload, pi, settings, str(qb_account_id), uk_fixed_global="NotApplicable"
+        )
 
         if getattr(pi, "due_date", None):
             payload["DueDate"] = str(pi.due_date)
