@@ -34,3 +34,149 @@ def get_region(settings):
 
 def is_us(settings):
 	return get_region(settings) == REGION_US
+
+
+# ---------------------------------------------------------------------------
+# UK (VAT) - unchanged original rules
+# ---------------------------------------------------------------------------
+
+
+def invoice_tax_rate(doc):
+	"""Rate of the first tax row with rate > 0, else 0 (original UK rule)."""
+	for tax in getattr(doc, "taxes", None) or []:
+		if float(tax.rate or 0) > 0:
+			return float(tax.rate)
+	return 0
+
+
+def uk_tax_code(rate, settings):
+	"""Map a VAT rate to a UK QuickBooks TaxCode Id (original mapping)."""
+	default_tax_code = getattr(settings, "default_tax_code", "12") or "12"
+	rate = float(rate or 0)
+	if rate >= 20:
+		return "3"
+	elif rate >= 5:
+		return "8"
+	elif rate > 0:
+		return "10"
+	return default_tax_code
+
+
+def uk_global_tax_calculation(rate):
+	return "TaxExcluded" if float(rate or 0) > 0 else "NotApplicable"
+
+
+# ---------------------------------------------------------------------------
+# US (sales tax)
+# ---------------------------------------------------------------------------
+
+
+def us_tax_rows(doc):
+	"""Tax rows whose account is a "Tax" account and that have an amount.
+
+	Freight and other charges booked through the taxes table are excluded.
+	"""
+	rows = []
+	for tax in getattr(doc, "taxes", None) or []:
+		if not flt(tax.tax_amount) or not tax.account_head:
+			continue
+		if frappe.db.get_value("Account", tax.account_head, "account_type") == "Tax":
+			rows.append(tax)
+	return rows
+
+
+def us_is_taxed(doc):
+	return bool(us_tax_rows(doc))
+
+
+def us_total_tax(doc):
+	"""Sales tax only, positive for invoices and returns alike."""
+	total = sum(flt(t.tax_amount_after_discount_amount) for t in us_tax_rows(doc))
+	return abs(flt(total, 2))
+
+
+# ---------------------------------------------------------------------------
+# Public helpers used by the payload builders
+# ---------------------------------------------------------------------------
+
+
+def sales_line_tax_code(doc, settings):
+	"""TaxCodeRef value for each line of an Invoice / CreditMemo."""
+	if is_us(settings):
+		return US_TAXABLE if us_is_taxed(doc) else US_NON_TAXABLE
+	return uk_tax_code(invoice_tax_rate(doc), settings)
+
+
+def apply_sales_tax(payload, doc, settings):
+	"""Add transaction-level tax fields to an Invoice / CreditMemo payload."""
+	if not is_us(settings):
+		payload["GlobalTaxCalculation"] = uk_global_tax_calculation(invoice_tax_rate(doc))
+		return payload
+
+	payload.pop("GlobalTaxCalculation", None)
+	if not us_is_taxed(doc):
+		return payload
+
+	if getattr(settings, "us_uses_ast", 0):
+		# AST companies calculate tax in QuickBooks; force ERPNext's amount.
+		payload["TxnTaxDetail"] = {"TotalTax": us_total_tax(doc)}
+	else:
+		tax_code = getattr(settings, "us_sales_tax_code", None)
+		if not tax_code:
+			frappe.throw(
+				"US Sales Tax Code ID is not set in Quickbooks Setting. "
+				"Use 'Fetch US Tax Codes' to pick one."
+			)
+		payload["TxnTaxDetail"] = {"TxnTaxCodeRef": {"value": str(tax_code)}}
+	return payload
+
+
+def expense_line_tax_code(doc, settings, uk_fixed=None):
+	"""TaxCodeRef value for Bill / VendorCredit lines, or None to omit it.
+
+	uk_fixed: UK builders that always sent a fixed code pass it here so their
+	payloads stay exactly as before.
+	"""
+	if is_us(settings):
+		return None
+	if uk_fixed is not None:
+		return uk_fixed
+	return uk_tax_code(invoice_tax_rate(doc), settings)
+
+
+def expense_line_detail(account_id, tax_code):
+	"""AccountBasedExpenseLineDetail, with TaxCodeRef only when tax_code is set."""
+	detail = {"AccountRef": {"value": account_id}}
+	if tax_code is not None:
+		detail["TaxCodeRef"] = {"value": tax_code}
+	return detail
+
+
+def apply_purchase_tax(payload, doc, settings, account_id, uk_fixed_global=None):
+	"""Add tax handling to a Bill / VendorCredit payload.
+
+	UK: set GlobalTaxCalculation exactly as before (rate based, or the fixed
+	value some builders always sent).
+	US: never send GlobalTaxCalculation; if the document has sales tax, add one
+	extra expense line for the tax amount on the same expense account.
+	"""
+	if not is_us(settings):
+		payload["GlobalTaxCalculation"] = uk_fixed_global or uk_global_tax_calculation(
+			invoice_tax_rate(doc)
+		)
+		return payload
+
+	payload.pop("GlobalTaxCalculation", None)
+	tax_amount = us_total_tax(doc)
+	if tax_amount:
+		# TODO: add a dedicated "US tax expense account" setting instead of
+		# booking purchase tax to the same expense account as the items.
+		payload.setdefault("Line", []).append(
+			{
+				"DetailType": "AccountBasedExpenseLineDetail",
+				"Amount": tax_amount,
+				"Description": "Sales tax",
+				"AccountBasedExpenseLineDetail": {"AccountRef": {"value": account_id}},
+			}
+		)
+	return payload
