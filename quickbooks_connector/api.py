@@ -8,6 +8,7 @@ from urllib.parse import urlencode, quote
 import secrets
 from datetime import timedelta
 from frappe.utils import flt
+from quickbooks_connector import qb_tax
 
 # ============ CONSTANTS ============
 DEFAULT_CUSTOMER_TYPE = "Company"
@@ -150,6 +151,9 @@ def oauth_callback(code=None, state=None, realmId=None, error=None):
         if test_result.get("success"):
             settings.is_connected = 1
             settings.company_name = test_result.get("company_name", "")
+            if "us_uses_ast" in test_result:
+                # keep the value test_connection() read from QB Preferences
+                settings.us_uses_ast = test_result["us_uses_ast"]
             settings.save(ignore_permissions=True)
             frappe.db.commit()
 
@@ -506,6 +510,13 @@ def test_connection():
         # Update settings
         settings.is_connected = 1
         settings.company_name = company_name
+
+        us_uses_ast = None
+        if qb_tax.is_us(settings):
+            us_uses_ast = fetch_us_uses_ast(api)
+            if us_uses_ast is not None:
+                settings.us_uses_ast = us_uses_ast
+
         settings.save()
         frappe.db.commit()
 
@@ -517,11 +528,14 @@ def test_connection():
             }
         )
 
-        return {
+        result = {
             "success": True,
             "company_name": company_name,
             "message": "Successfully connected to QuickBooks"
         }
+        if us_uses_ast is not None:
+            result["us_uses_ast"] = us_uses_ast
+        return result
 
     except Exception as e:
         error_msg = str(e)
@@ -542,6 +556,45 @@ def test_connection():
             "success": False,
             "error": error_msg
         }
+
+def fetch_us_uses_ast(api):
+    """Read Preferences.TaxPrefs.PartnerTaxEnabled (Automated Sales Tax).
+
+    Returns 1/0, or None if Preferences could not be read. A failure here is
+    logged but never fails the connection test.
+    """
+    try:
+        prefs = api.make_request("preferences", params={"minorversion": 65})
+        tax_prefs = (prefs or {}).get("Preferences", {}).get("TaxPrefs", {})
+        return 1 if tax_prefs.get("PartnerTaxEnabled") else 0
+    except Exception as e:
+        frappe.log_error(
+            title="QuickBooks Preferences Error",
+            message=f"Could not read TaxPrefs.PartnerTaxEnabled: {str(e)}"
+        )
+        return None
+
+
+@frappe.whitelist()
+def get_us_tax_codes():
+    """List QuickBooks TaxCodes so a US Sales Tax Code ID can be picked."""
+    frappe.only_for("System Manager")
+    api = QuickBooksAPI()
+    response = api.make_request(
+        f"query?query={quote('SELECT * FROM TaxCode MAXRESULTS 1000')}",
+        params={"minorversion": 65}
+    )
+    codes = (response or {}).get("QueryResponse", {}).get("TaxCode", [])
+    return [
+        {
+            "Id": c.get("Id"),
+            "Name": c.get("Name"),
+            "Active": c.get("Active"),
+            "Taxable": c.get("Taxable"),
+        }
+        for c in codes
+    ]
+
 
 @frappe.whitelist()
 def disconnect():
