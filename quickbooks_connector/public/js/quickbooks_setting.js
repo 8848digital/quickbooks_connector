@@ -382,7 +382,15 @@ function test_quickbooks_connection(frm) {
         freeze_message: __("Testing QuickBooks connection..."),
         callback: function(r) {
             if (r.message && r.message.success) {
-                frappe.msgprint({ title: __("Connection Successful"), message: __("Successfully connected to: ") + `<b>${r.message.company_name}</b>`, indicator: "green" });
+                let message = __("Successfully connected to: ") + `<b>${r.message.company_name}</b>`;
+                if (r.message.warning) {
+                    message += "<br><br>" + __("Warning: ") + frappe.utils.escape_html(r.message.warning);
+                }
+                frappe.msgprint({
+                    title: __("Connection Successful"),
+                    message: message,
+                    indicator: r.message.warning ? "orange" : "green"
+                });
                 frm.reload_doc();
             } else {
                 frappe.msgprint({ title: __("Connection Failed"), message: r.message ? (r.message.error || __("Unknown error")) : __("Server error"), indicator: "red" });

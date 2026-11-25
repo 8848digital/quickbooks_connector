@@ -506,6 +506,9 @@ def test_connection():
             frappe.throw(_("CompanyInfo missing in QuickBooks response"))
 
         company_name = company_info.get('CompanyInfo', {}).get('CompanyName', 'Unknown')
+        region_warning = qb_tax.region_country_warning(
+            settings, company_info.get('CompanyInfo', {}).get('Country')
+        )
 
         # Update settings
         settings.is_connected = 1
@@ -520,19 +523,22 @@ def test_connection():
         settings.save()
         frappe.db.commit()
 
-        log_action(
-            "Connection Test Success",
-            {
-                "company": company_name,
-                "timestamp": now_datetime()
-            }
-        )
+        log_details = {
+            "company": company_name,
+            "timestamp": now_datetime()
+        }
+        if region_warning:
+            log_details["warning"] = region_warning
+        log_action("Connection Test Success", log_details)
 
         result = {
             "success": True,
             "company_name": company_name,
             "message": "Successfully connected to QuickBooks"
         }
+        if region_warning:
+            result["warning"] = region_warning
+            result["message"] += f". Warning: {region_warning}"
         if us_uses_ast is not None:
             result["us_uses_ast"] = us_uses_ast
         return result

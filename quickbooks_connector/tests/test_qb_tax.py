@@ -561,3 +561,47 @@ class TestSettingDefaults(unittest.TestCase):
 			self.assertEqual(fields[fieldname].get("default"), default, fieldname)
 		self.assertEqual(fields["us_uses_ast"].get("read_only"), 1)
 		self.assertEqual(fields["qb_region"]["options"], "UK\nUS")
+
+
+class TestRegionCountryCheck(unittest.TestCase):
+	def test_region_country_warning(self):
+		us, uk = make_settings(qb_region="US"), make_settings()
+		self.assertIsNone(qb_tax.region_country_warning(us, "US"))
+		self.assertIsNone(qb_tax.region_country_warning(us, "United States"))
+		self.assertIsNone(qb_tax.region_country_warning(uk, "GB"))
+		self.assertIsNone(qb_tax.region_country_warning(uk, "UK"))
+		self.assertIsNone(qb_tax.region_country_warning(uk, None))
+		self.assertIn("GB", qb_tax.region_country_warning(us, "GB"))
+		self.assertIn("US", qb_tax.region_country_warning(uk, "US"))
+		self.assertIsNotNone(qb_tax.region_country_warning(uk, "CA"))
+
+	def _test_connection(self, settings, country):
+		from quickbooks_connector import api
+
+		settings.access_token = "token"
+		settings.save = mock.MagicMock()
+		instance = mock.MagicMock()
+		instance.get_company_info.return_value = {"CompanyInfo": {"CompanyName": "Acme", "Country": country}}
+		instance.make_request.return_value = {"Preferences": {"TaxPrefs": {"PartnerTaxEnabled": False}}}
+		with mock.patch.object(api, "get_settings", return_value=settings), mock.patch.object(
+			api, "QuickBooksAPI", return_value=instance
+		), mock.patch.object(api, "log_action") as log_action, mock.patch.object(frappe, "db", mock.MagicMock()):
+			result = api.test_connection()
+		return result, log_action
+
+	def test_connection_warns_on_mismatch_without_changing_region(self):
+		settings = make_settings(qb_region="US")
+		result, log_action = self._test_connection(settings, "GB")
+		self.assertTrue(result["success"])
+		self.assertIn("GB", result["warning"])
+		self.assertIn("Warning:", result["message"])
+		self.assertEqual(settings.qb_region, "US")
+		self.assertEqual(log_action.call_args.args[1]["warning"], result["warning"])
+
+	def test_connection_no_warning_when_matching(self):
+		result, _ = self._test_connection(make_settings(), "GB")
+		self.assertNotIn("warning", result)
+		self.assertEqual(result["message"], "Successfully connected to QuickBooks")
+		result, _ = self._test_connection(make_settings(qb_region="US"), "US")
+		self.assertNotIn("warning", result)
+		self.assertEqual(result["us_uses_ast"], 0)

@@ -36,6 +36,31 @@ def is_us(settings):
 	return get_region(settings) == REGION_US
 
 
+# CompanyInfo.Country values that belong to each region
+_REGION_COUNTRIES = {
+	REGION_US: {"US", "USA", "UNITED STATES", "UNITED STATES OF AMERICA"},
+	REGION_UK: {"GB", "UK", "GBR", "UNITED KINGDOM", "GREAT BRITAIN"},
+}
+
+
+def region_country_warning(settings, qb_country):
+	"""Warning text if QuickBooks' CompanyInfo.Country does not match qb_region.
+
+	Returns None when they match or QuickBooks did not report a country.
+	Never changes the setting.
+	"""
+	country = " ".join(str(qb_country or "").split()).upper()
+	if not country:
+		return None
+	region = get_region(settings)
+	if country in _REGION_COUNTRIES[region]:
+		return None
+	return (
+		f"The QuickBooks company's country is {qb_country}, but QuickBooks Region "
+		f"is set to {region}. Check the QuickBooks Region setting."
+	)
+
+
 # ---------------------------------------------------------------------------
 # UK (VAT) - unchanged original rules
 # ---------------------------------------------------------------------------
