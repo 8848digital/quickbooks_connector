@@ -658,3 +658,37 @@ class TestExpenseAccountLookup(unittest.TestCase):
 		self.assertEqual(args[:2], ("Purchase Invoice", "PINV-0001"))
 		self.assertEqual(args[2]["quickbooks_sync_status"], "Synced")
 		self.assertEqual(args[2]["quickbooks_id"], "148")
+
+
+class TestCustomerPaymentEntry(unittest.TestCase):
+	def test_sets_company_and_ignores_cancelled_invoice(self):
+		from quickbooks_connector import api
+
+		lookups = []
+
+		def get_value(doctype, filters=None, fieldname=None, *args, **kwargs):
+			lookups.append((doctype, filters))
+			return {"Customer": "Cust A", "Company": "Debtors - UTC", "Sales Invoice": "SINV-0001-1"}.get(doctype)
+
+		pe = mock.MagicMock()
+		qb_payment = {
+			"Id": "150",
+			"TotalAmt": 162.38,
+			"TxnDate": "2026-11-26",
+			"CustomerRef": {"value": "29"},
+			"Line": [{"Amount": 162.38, "LinkedTxn": [{"TxnId": "146", "TxnType": "Invoice"}]}],
+		}
+		settings = make_settings(company="US Test Co", default_account="Cash - UTC")
+		with mock.patch.object(api, "get_settings", return_value=settings), mock.patch.object(
+			frappe, "db", mock.MagicMock()
+		), mock.patch.object(frappe, "get_doc", return_value=pe) as get_doc:
+			frappe.db.exists.return_value = False
+			frappe.db.get_value.side_effect = get_value
+			self.assertEqual(api.create_or_update_payment_entry(qb_payment), "created")
+		self.assertEqual(get_doc.call_args.args[0]["company"], "US Test Co")
+		self.assertIn(("Sales Invoice", {"quickbooks_id": "146", "docstatus": 1}), lookups)
+		pe.append.assert_called_once_with(
+			"references",
+			{"reference_doctype": "Sales Invoice", "reference_name": "SINV-0001-1", "allocated_amount": 162.38},
+		)
+		pe.submit.assert_called_once()

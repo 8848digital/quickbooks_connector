@@ -2159,7 +2159,8 @@ def create_or_update_bill_payment_entry(qb_bill_payment):
                     if qb_bill_id:
                         purchase_invoice = frappe.db.get_value(
                             "Purchase Invoice",
-                            {"quickbooks_id": qb_bill_id},
+                            # an amended bill shares the QB id with the cancelled original
+                            {"quickbooks_id": qb_bill_id, "docstatus": 1},
                             ["name", "outstanding_amount", "grand_total", "credit_to"],
                             as_dict=True
                         )
@@ -2972,6 +2973,9 @@ def create_or_update_payment_entry(qb_payment):
         # -----------------------------
         pe = frappe.get_doc({
             "doctype": "Payment Entry",
+            # without company ERPNext uses the user's default company and then
+            # can't find the invoice ("has already been fully paid")
+            "company": settings.company,
             "payment_type": "Receive",
             "party_type": "Customer",
             "party": customer,
@@ -2995,9 +2999,10 @@ def create_or_update_payment_entry(qb_payment):
                 if txn.get("TxnType") == "Invoice":
                     qb_invoice_id = txn.get("TxnId")
 
+                    # an amended invoice shares the QB id with the cancelled original
                     erp_invoice = frappe.db.get_value(
                         "Sales Invoice",
-                        {"quickbooks_id": qb_invoice_id},
+                        {"quickbooks_id": qb_invoice_id, "docstatus": 1},
                         "name"
                     )
 
