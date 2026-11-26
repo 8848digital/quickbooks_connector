@@ -872,10 +872,17 @@ def create_or_update_customer(qb_customer):
             for qb_field, erp_field in address_fields.items():
                 if billing_address.get(qb_field):
                     customer_data[erp_field] = billing_address.get(qb_field)
+            # ERPNext builds the primary Address from these fields, and
+            # Address.country is a Link: "USA" must become "United States".
+            customer_data["country"] = qb_address.normalize_country(
+                customer_data.get("country"), settings
+            )
 
         if existing:
             customer = frappe.get_doc("Customer", existing[0])
             customer.update(customer_data)
+            # data came from QuickBooks: don't push it straight back (on_update hook)
+            customer.flags.from_quickbooks = True
             customer.save(ignore_permissions=True)
             _update_party_address(qb_customer.get('BillAddr', {}), "Customer", existing[0])
             return "updated"
@@ -884,6 +891,7 @@ def create_or_update_customer(qb_customer):
                 "doctype": "Customer",
                 **customer_data
             })
+            customer.flags.from_quickbooks = True
             customer.insert(ignore_permissions=True)
             _update_party_address(qb_customer.get('BillAddr', {}), "Customer", customer.name)
             return "created"

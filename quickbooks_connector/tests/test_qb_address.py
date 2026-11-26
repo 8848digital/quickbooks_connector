@@ -143,3 +143,63 @@ class TestInboundAddress(unittest.TestCase):
 
 	def test_missing_country_without_default_is_uk(self):
 		self.assertEqual(self._address_country(None, make_settings()), "United Kingdom")
+
+
+class TestInboundCustomerSync(unittest.TestCase):
+	"""QuickBooks -> ERPNext customer sync."""
+
+	def _create(self, qb_customer, settings=None):
+		from quickbooks_connector import api
+
+		new_doc = mock.MagicMock()
+		new_doc.name = "Cust A"
+		with mock.patch.object(api, "get_settings", return_value=settings or make_settings(company="US Test Co")), mock.patch.object(
+			frappe, "db", mock.MagicMock()
+		), mock.patch.object(frappe, "get_doc", return_value=new_doc) as get_doc, mock.patch.object(
+			api, "_update_party_address"
+		):
+			frappe.db.get_value.return_value = None  # not synced before
+			frappe.db.exists.return_value = True  # default group / territory exist
+			result = api.create_or_update_customer(qb_customer)
+		return result, get_doc.call_args.args[0], new_doc
+
+	def test_usa_country_is_normalised(self):
+		qb_customer = {
+			"Id": "14",
+			"DisplayName": "Amy's Bird Sanctuary",
+			"BillAddr": {"Line1": "4581 Finch St.", "City": "Bayshore", "Country": "USA", "PostalCode": "94326"},
+		}
+		result, data, _ = self._create(qb_customer)
+		self.assertEqual(result, "created")
+		self.assertEqual(data["country"], "United States")
+		self.assertEqual(data["city"], "Bayshore")
+
+	def test_no_country_key_when_qb_sends_none(self):
+		_, data, _ = self._create({"Id": "15", "DisplayName": "No Address"})
+		self.assertNotIn("country", data)
+
+	def test_synced_customer_is_flagged_so_it_is_not_pushed_back(self):
+		_, _, new_doc = self._create({"Id": "15", "DisplayName": "No Address"})
+		self.assertTrue(new_doc.flags.from_quickbooks)
+		new_doc.insert.assert_called_once()
+
+	def test_on_customer_update_skips_flagged_docs(self):
+		from quickbooks_connector import qb_customer_hooks
+
+		doc = SimpleNamespace(name="Cust A", quickbooks_id="14", flags=frappe._dict(from_quickbooks=True))
+		with mock.patch.object(qb_customer_hooks, "sync_customer_to_qb") as push, mock.patch(
+			"quickbooks_connector.api.get_settings"
+		) as get_settings:
+			qb_customer_hooks.on_customer_update(doc)
+		push.assert_not_called()
+		get_settings.assert_not_called()
+
+	def test_on_customer_update_still_pushes_user_edits(self):
+		from quickbooks_connector import qb_customer_hooks
+
+		doc = SimpleNamespace(name="Cust A", quickbooks_id="14", flags=frappe._dict())
+		with mock.patch.object(qb_customer_hooks, "sync_customer_to_qb") as push, mock.patch(
+			"quickbooks_connector.api.get_settings", return_value=make_settings()
+		):
+			qb_customer_hooks.on_customer_update(doc)
+		push.assert_called_once_with(doc, "14")

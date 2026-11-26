@@ -3,8 +3,14 @@ import frappe
 
 def on_customer_update(doc, method=None):
     """Auto sync customer address/contact to QuickBooks on update"""
+    # Saved by the QuickBooks -> ERPNext customer sync: the data already
+    # matches QuickBooks, and pushing every synced customer back (a GET and a
+    # POST each) made Sync Customers time out.
+    if doc.flags.get("from_quickbooks"):
+        return
+
     try:
-    
+
         from quickbooks_connector.api import get_settings
         settings = get_settings()
 
