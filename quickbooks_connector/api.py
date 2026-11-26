@@ -1345,6 +1345,24 @@ def push_purchase_invoice_to_quickbooks(purchase_invoice_name: str):
         frappe.log_error("QuickBooks Bill Push Error", f"{purchase_invoice_name}: {str(e)}")
         return {"success": False, "error": str(e)}
 
+def get_qb_expense_account_id(settings):
+    """QuickBooks Id of the expense account used on Bill / VendorCredit lines.
+
+    The previous filter combined ["quickbooks_id", "!=", ""] with
+    ["quickbooks_id", "!=", None]. frappe.db.get_value keeps one condition per
+    field, and "!= NULL" matches no row, so no account was ever found.
+    """
+    return frappe.db.get_value(
+        "Account",
+        [
+            ["company", "=", settings.company],
+            ["quickbooks_id", "is", "set"],
+            ["account_type", "in", ["Expense Account", "Cost of Goods Sold"]]
+        ],
+        "quickbooks_id"
+    )
+
+
 def create_qb_bill_from_purchase_invoice(pi):
     """
     Purchase Invoice -> QuickBooks Bill
@@ -1368,16 +1386,7 @@ def create_qb_bill_from_purchase_invoice(pi):
 
     invoice_tax_rate = qb_tax.invoice_tax_rate(pi)
 
-    qb_account_id = frappe.db.get_value(
-        "Account",
-        [
-            ["company", "=", settings.company],
-            ["quickbooks_id", "!=", ""],
-            ["quickbooks_id", "!=", None],
-            ["account_type", "in", ["Expense Account", "Cost of Goods Sold"]]
-        ],
-        "quickbooks_id"
-    )
+    qb_account_id = get_qb_expense_account_id(settings)
 
 
     if not qb_account_id:
@@ -1492,7 +1501,7 @@ def _mark_purchase_invoice_sync_success(pi, qb_bill_id=None, doc_number=None):
     
         try:
             meta = frappe.get_meta("Purchase Invoice")
-            if hasattr(meta, 'quickbooks_sync_status'):
+            if meta.has_field('quickbooks_sync_status'):  # hasattr(meta, ...) was always False
                 update_fields["quickbooks_sync_status"] = "Synced"
         except Exception:
             pass
@@ -1520,7 +1529,7 @@ def _mark_purchase_invoice_sync_error(pi, error_message: str):
     
         try:
             meta = frappe.get_meta("Purchase Invoice")
-            if hasattr(meta, 'quickbooks_sync_status'):
+            if meta.has_field('quickbooks_sync_status'):  # hasattr(meta, ...) was always False
                 update_fields["quickbooks_sync_status"] = "Error"
         except Exception:
             pass
@@ -3501,16 +3510,7 @@ def manual_create_vendor_credit(purchase_invoice_name):
         if not qb_vendor_id:
             return {"success": False, "error": f"Supplier '{pi.supplier}' missing QB ID"}
 
-        qb_account_id = frappe.db.get_value(
-            "Account",
-            [
-                ["company", "=", settings.company],
-                ["quickbooks_id", "!=", ""],
-                ["quickbooks_id", "!=", None],
-                ["account_type", "in", ["Expense Account", "Cost of Goods Sold"]]
-            ],
-            "quickbooks_id"
-        )
+        qb_account_id = get_qb_expense_account_id(settings)
         if not qb_account_id:
             return {"success": False, "error": "No expense account mapped to QuickBooks. Please sync accounts first via Quickbooks Setting → Sync Accounts."}
 
@@ -3828,16 +3828,7 @@ def manual_amend_bill(purchase_invoice_name):
         if not qb_vendor_id:
             return {"success": False, "error": f"Supplier '{pi.supplier}' missing QB ID"}
 
-        qb_account_id = frappe.db.get_value(
-            "Account",
-            [
-                ["company", "=", settings.company],
-                ["quickbooks_id", "!=", ""],
-                ["quickbooks_id", "!=", None],
-                ["account_type", "in", ["Expense Account", "Cost of Goods Sold"]]
-            ],
-            "quickbooks_id"
-        )
+        qb_account_id = get_qb_expense_account_id(settings)
         if not qb_account_id:
             return {"success": False, "error": "No expense account mapped to QuickBooks. Please sync accounts first via Quickbooks Setting → Sync Accounts."}
 

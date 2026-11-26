@@ -631,3 +631,30 @@ class TestOAuthCallbackSave(unittest.TestCase):
 		self.assertEqual(calls, ["reload", "save"])
 		self.assertEqual(settings.is_connected, 1)
 		self.assertEqual(settings.company_name, "Acme")
+
+
+class TestExpenseAccountLookup(unittest.TestCase):
+	def test_uses_is_set_filter(self):
+		"""["quickbooks_id", "!=", None] made get_value match no account at all."""
+		from quickbooks_connector import api
+
+		with mock.patch.object(frappe, "db", mock.MagicMock()):
+			frappe.db.get_value.return_value = "80"
+			self.assertEqual(api.get_qb_expense_account_id(make_settings(company="US Test Co")), "80")
+			filters = frappe.db.get_value.call_args.args[1]
+		self.assertIn(["quickbooks_id", "is", "set"], filters)
+		self.assertIn(["company", "=", "US Test Co"], filters)
+		self.assertNotIn(["quickbooks_id", "!=", None], filters)
+
+	def test_bill_success_sets_synced_status(self):
+		"""_mark_purchase_invoice_sync_success used hasattr(meta, ...), always False."""
+		from quickbooks_connector import api
+
+		meta = mock.Mock()
+		meta.has_field.side_effect = lambda f: f == "quickbooks_sync_status"
+		with mock.patch.object(frappe, "db", mock.MagicMock()), mock.patch.object(frappe, "get_meta", return_value=meta):
+			api._mark_purchase_invoice_sync_success(SimpleNamespace(name="PINV-0001"), "148", "PINV-0001")
+			args = frappe.db.set_value.call_args.args
+		self.assertEqual(args[:2], ("Purchase Invoice", "PINV-0001"))
+		self.assertEqual(args[2]["quickbooks_sync_status"], "Synced")
+		self.assertEqual(args[2]["quickbooks_id"], "148")
