@@ -149,11 +149,12 @@ def oauth_callback(code=None, state=None, realmId=None, error=None):
 
         test_result = test_connection()
         if test_result.get("success"):
+            # test_connection() saved its own copy of the settings (including
+            # us_uses_ast); reload so this save doesn't fail with "Document has
+            # been modified after you have opened it".
+            settings.reload()
             settings.is_connected = 1
             settings.company_name = test_result.get("company_name", "")
-            if "us_uses_ast" in test_result:
-                # keep the value test_connection() read from QB Preferences
-                settings.us_uses_ast = test_result["us_uses_ast"]
             settings.save(ignore_permissions=True)
             frappe.db.commit()
 

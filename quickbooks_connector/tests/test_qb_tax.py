@@ -605,3 +605,29 @@ class TestRegionCountryCheck(unittest.TestCase):
 		result, _ = self._test_connection(make_settings(qb_region="US"), "US")
 		self.assertNotIn("warning", result)
 		self.assertEqual(result["us_uses_ast"], 0)
+
+
+class TestOAuthCallbackSave(unittest.TestCase):
+	def test_reloads_settings_before_final_save(self):
+		"""test_connection() saves the settings itself; the callback must reload
+		before saving, or Frappe raises TimestampMismatchError."""
+		from quickbooks_connector import api
+
+		calls = []
+		settings = mock.MagicMock()
+		settings.reload.side_effect = lambda: calls.append("reload")
+		settings.save.side_effect = lambda **k: calls.append("save")
+		cache = mock.MagicMock()
+		cache.get_value.return_value = {"redirect_uri": "x"}
+		with mock.patch.object(frappe, "cache", return_value=cache), mock.patch.object(
+			api, "get_settings", return_value=settings
+		), mock.patch.object(api, "exchange_code_for_tokens", return_value={"access_token": "a"}), mock.patch.object(
+			api, "save_tokens"
+		), mock.patch.object(
+			api, "test_connection", return_value={"success": True, "company_name": "Acme"}
+		), mock.patch.object(api, "log_action"), mock.patch.object(frappe, "db", mock.MagicMock()):
+			page = api.oauth_callback(code="c", state="s", realmId="123")
+		self.assertIn("Successfully Connected", page)
+		self.assertEqual(calls, ["reload", "save"])
+		self.assertEqual(settings.is_connected, 1)
+		self.assertEqual(settings.company_name, "Acme")
